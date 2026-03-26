@@ -1,6 +1,6 @@
 # 🚁 ESP32 Quadcopter Flight Controller
 
-A fully custom, from-scratch flight controller built on the **ESP32** microcontroller. No libraries, no shortcuts — raw I2C, hand-tuned PID, and a Kalman filter running at 250Hz.
+A fully custom, from-scratch flight controller built on the **ESP32** microcontroller. No libraries, no shortcuts — raw I2C, PWM receiver input via interrupts, hand-tuned cascaded PID, and a Kalman filter running at 250Hz.
 
 ---
 
@@ -9,7 +9,9 @@ A fully custom, from-scratch flight controller built on the **ESP32** microcontr
 - **Cascaded PID Control** — Outer angle loop feeds into inner rate loop for smooth, stable flight
 - **1D Kalman Filter** — Fuses gyroscope and accelerometer data for accurate angle estimation
 - **Raw I2C Communication** — Talks directly to the MPU-6050 with no external IMU libraries
-- **Auto-Calibration** — On every boot, averages 2000 samples to zero out gyro drift and accel bias
+- **PWM Receiver Input** — 4-channel RC input read via hardware interrupts for zero-latency response
+- **Arm/Disarm Logic** — Safe arming sequence (Throttle low + Yaw right to arm, Yaw left to disarm)
+- **Auto-Calibration** — Averages 2000 samples on boot to zero out gyro drift and accel bias
 - **Quadcopter Motor Mixing** — Correct X-frame mixing for Roll, Pitch, and Yaw authority
 - **Precise 4ms Control Loop** — Hard 250Hz timing using `micros()` for deterministic control
 
@@ -19,20 +21,51 @@ A fully custom, from-scratch flight controller built on the **ESP32** microcontr
 
 | Component | Details |
 |---|---|
-| Microcontroller | ESP32 (I2C on GPIO 21/22) |
+| Microcontroller | ESP32 |
 | IMU | MPU-6050 (Gyro ±500°/s, Accel ±8g) |
-| Motors | 4x Brushless DC (via ESC, PWM 1180–2000µs) |
-| Transmitter | Integrated (ESP32 onboard) |
+| Motors | 4x Brushless DC via ESC |
+| ESC Signal | PWM 250Hz, 11-bit (1180–2000µs range) |
+| Receiver | 4-channel PWM RC Receiver |
+
+---
+
+## 📌 Pin Map
+
+### MPU-6050 (I2C)
+| MPU-6050 Pin | ESP32 Pin |
+|---|---|
+| SDA | GPIO 21 |
+| SCL | GPIO 22 |
+| VCC | 3.3V |
+| GND | GND |
+
+### ESC / Motors
+| Motor | Position | ESP32 Pin | LEDC Channel |
+|---|---|---|---|
+| Motor 1 | Front-Left | GPIO 13 | CH 0 |
+| Motor 2 | Rear-Left | GPIO 12 | CH 1 |
+| Motor 3 | Front-Right | GPIO 14 | CH 2 |
+| Motor 4 | Rear-Right | GPIO 27 | CH 3 |
+
+### RC Receiver (PWM Input)
+| Channel | Function | ESP32 Pin |
+|---|---|---|
+| CH1 | Roll | GPIO 34 |
+| CH2 | Pitch | GPIO 35 |
+| CH3 | Throttle | GPIO 32 |
+| CH4 | Yaw | GPIO 33 |
+
+> ⚠️ GPIO 34 & 35 are **input-only** pins on ESP32 — perfect for receiver signals.
 
 ---
 
 ## 🧠 How It Works
 
 ### 1. Sensor Reading
-The MPU-6050 is read directly over I2C at 400kHz. Raw 16-bit values are converted to degrees/s (gyro) and g-forces (accel). A hardware low-pass filter is configured on the MPU for noise reduction.
+The MPU-6050 is read directly over I2C at 400kHz. Raw 16-bit values are converted to °/s (gyro) and g-forces (accel). A hardware low-pass filter is configured on the MPU for noise reduction.
 
 ### 2. Kalman Filter
-A 1D Kalman filter fuses the accelerometer angle (absolute but noisy) with the gyroscope rate (fast but drifts) to produce a clean, accurate angle estimate for both Roll and Pitch.
+A 1D Kalman filter fuses the accelerometer angle (absolute but noisy) with gyroscope rate (fast but drifts) to produce a clean, accurate angle estimate for Roll and Pitch.
 
 ```
 Prediction:  state += dt * gyro_rate
@@ -49,9 +82,18 @@ Desired Angle → [Angle PID] → Desired Rate → [Rate PID] → Motor Output
 - **Angle loop** corrects the drone's tilt
 - **Rate loop** controls how fast it rotates — giving crisp, locked-in feel
 
-### 4. Motor Mixing
-Standard X-frame quadcopter mixing:
+### 4. RC Input via Interrupts
+Each receiver channel is read using `attachInterrupt()` on CHANGE — measuring the PWM pulse width in microseconds. Values are safely copied out of the ISR using `noInterrupts()`.
 
+### 5. Arm / Disarm
+| Action | Stick Position |
+|---|---|
+| ✅ Arm | Throttle LOW + Yaw RIGHT (>1900µs) |
+| ❌ Disarm | Throttle LOW + Yaw LEFT (<1100µs) |
+
+When disarmed, all motors are held at minimum. The drone will not respond to any input until armed.
+
+### 6. Motor Mixing (X-Frame)
 ```
 Motor1 (Front-Left)  = Throttle - Roll - Pitch - Yaw
 Motor2 (Rear-Left)   = Throttle - Roll + Pitch + Yaw
@@ -65,7 +107,7 @@ Motor4 (Rear-Right)  = Throttle + Roll - Pitch + Yaw
 
 | Loop | P | I | D |
 |---|---|---|---|
-| Angle | 2.0 | 0.0 | 0.0 |
+| Angle (Roll/Pitch) | 2.0 | 0.0 | 0.0 |
 | Rate (Roll/Pitch) | 0.6 | 3.5 | 0.03 |
 | Rate (Yaw) | 2.0 | 12.0 | 0.0 |
 
@@ -87,7 +129,7 @@ Motor4 (Rear-Right)  = Throttle + Roll - Pitch + Yaw
 ## 📊 Serial Debug Output
 
 ```
-Roll: 0.42  Pitch: -0.18  | M1: 1524  M2: 1516  M3: 1531  M4: 1509
+ARM: 1  M1: 1524  M2: 1516  M3: 1531  M4: 1509
 ```
 
 ---
