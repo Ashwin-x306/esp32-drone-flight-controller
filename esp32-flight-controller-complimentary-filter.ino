@@ -1,262 +1,614 @@
-#include <Arduino.h>
-#include <ESP32Servo.h>
+// ============================================================
+//   ESP32 FLIGHT CONTROLLER
+//   Updated for drone configuration
+//   M1=GPIO27 M2=GPIO14 M3=GPIO12 M4=GPIO13
+//   RC Calibrated to your transmitter values
+//   + Emergency Stop CH5 (VrA knob GPIO25)
+//   + Fixed loop timer bug
+//   + Separate ISR per channel
+// ============================================================
+
 #include <Wire.h>
+#include <ESP32Servo.h>
 
-/* ================= CONFIG ================= */
-#define MPU_ADDR 0x68
+// ================== YOUR MOTOR PINS ==================
+//        FRONT
+//  M4(CW)13 ── M1(CCW)27
+//       \  X  /
+//  M3(CCW)12 ── M2(CW)14
+//        REAR
 
-// RX Pins
-#define CH1 34   // Roll
-#define CH2 35   // Pitch
-#define CH3 32   // Throttle
-#define CH4 33   // Yaw
+const int mot1_pin = 27;   // Front-Right CCW
+const int mot2_pin = 14;   // Rear-Right  CW
+const int mot3_pin = 12;   // Rear-Left   CCW
+const int mot4_pin = 13;   // Front-Left  CW
 
-// Motor Pins
-#define M13_PIN 13
-#define M12_PIN 12
-#define M14_PIN 14
-#define M27_PIN 27
+// ================== RC PINS ==================
+const int channel_1_pin = 34;   // Roll
+const int channel_2_pin = 35;   // Pitch
+const int channel_3_pin = 32;   // Throttle
+const int channel_4_pin = 33;   // Yaw
+const int channel_5_pin = 25;   // Emergency Stop (VrA knob)
 
-/* ================= GLOBALS ================= */
+// ================== LED ==================
+#define LED_PIN   15
 
-// ---------- Gyro ----------
-int16_t GyroXraw, GyroYraw, GyroZraw;
-float gyroRoll, gyroPitch, gyroYaw;
-float gyroRollOffset = 0, gyroPitchOffset = 0, gyroYawOffset = 0;
+// ================== ESC ==================
+int ESCfreq     = 500;
+int ThrottleIdle   = 1180;   // your ESC starts at 1180
+int ThrottleCutOff = 1000;
+int ThrottleMax    = 1800;
 
-// ---------- Accel ----------
-int16_t AccXraw, AccYraw, AccZraw;
-float accRoll, accPitch;
-float accXOffset = 0, accYOffset = 0, accZOffset = 0;
+// ================== LOOP TIMING ==================
+uint32_t LoopTimer;
+float t = 0.004f;   // 4ms = 250Hz
 
-// ---------- Angles ----------
-float rollAngle = 0;
-float pitchAngle = 0;
-const float alpha = 0.98;
+// ================== MPU6050 ==================
+#define MPU_ADDR  0x68
 
-// ---------- PID ----------
-float PRoll = 4.0, IRoll = 0.02, DRoll = 0.08;
-float PPitch = 4.0, IPitch = 0.02, DPitch = 0.08;
-float PYaw = 2.0, IYaw = 0.0, DYaw = 0.0;
+volatile float RateRoll, RatePitch, RateYaw;
+volatile float AccX, AccY, AccZ;
+volatile float AngleRoll, AnglePitch;
 
-float iRoll = 0, iPitch = 0, iYaw = 0;
-float prevRollErr = 0, prevPitchErr = 0, prevYawErr = 0;
+// ================== CALIBRATION ==================
+// Auto-computed on boot — no hardcoded values!
+float RateCalibrationRoll  = 0;
+float RateCalibrationPitch = 0;
+float RateCalibrationYaw   = 0;
+float AccXCalibration      = 0;
+float AccYCalibration      = 0;
+float AccZCalibration      = 0;
 
-// Timing
-unsigned long lastTime = 0;
+// ================== COMPLEMENTARY FILTER ==================
+float complementaryAngleRoll  = 0.0f;
+float complementaryAnglePitch = 0.0f;
 
-// ---------- RX ----------
-volatile int ch1_value = 1500;
-volatile int ch2_value = 1500;
-volatile int ch3_value = 1000;
-volatile int ch4_value = 1500;
+// ================== PID GAINS ==================
+// Outer — Angle loop
+float PAngleRoll  = 2.0f;  float PAnglePitch  = 2.0f;
+float IAngleRoll  = 0.5f;  float IAnglePitch  = 0.5f;
+float DAngleRoll  = 0.007f; float DAnglePitch = 0.007f;
 
-unsigned long ch1_start, ch2_start, ch3_start, ch4_start;
+// Inner — Rate loop Roll/Pitch
+float PRateRoll  = 0.625f; float PRatePitch  = 0.625f;
+float IRateRoll  = 2.1f;   float IRatePitch  = 2.1f;
+float DRateRoll  = 0.0088f; float DRatePitch = 0.0088f;
 
-// ---------- Motors ----------
-Servo mot13, mot12, mot14, mot27;
+// Inner — Rate loop Yaw
+float PRateYaw = 4.0f;
+float IRateYaw = 3.0f;
+float DRateYaw = 0.0f;
 
-/* ================= INTERRUPTS ================= */
-void IRAM_ATTR ch1_ISR() { if (digitalRead(CH1)) ch1_start = micros(); else ch1_value = micros() - ch1_start; }
-void IRAM_ATTR ch2_ISR() { if (digitalRead(CH2)) ch2_start = micros(); else ch2_value = micros() - ch2_start; }
-void IRAM_ATTR ch3_ISR() { if (digitalRead(CH3)) ch3_start = micros(); else ch3_value = micros() - ch3_start; }
-void IRAM_ATTR ch4_ISR() { if (digitalRead(CH4)) ch4_start = micros(); else ch4_value = micros() - ch4_start; }
+// ================== PID STATE ==================
+float PtermRoll, ItermRoll, DtermRoll, PIDOutputRoll;
+float PtermPitch, ItermPitch, DtermPitch, PIDOutputPitch;
+float PtermYaw, ItermYaw, DtermYaw, PIDOutputYaw;
 
-/* ================= SENSOR ================= */
-void readGyro() {
-  Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x43);
-  Wire.endTransmission(false);
-  Wire.requestFrom(MPU_ADDR, 6, true);
+float DesiredAngleRoll=0,  DesiredAnglePitch=0;
+float ErrorAngleRoll=0,    ErrorAnglePitch=0;
+float PrevErrorAngleRoll=0, PrevErrorAnglePitch=0;
+float PrevItermAngleRoll=0, PrevItermAnglePitch=0;
 
-  GyroXraw = Wire.read() << 8 | Wire.read();
-  GyroYraw = Wire.read() << 8 | Wire.read();
-  GyroZraw = Wire.read() << 8 | Wire.read();
+float DesiredRateRoll=0,   DesiredRatePitch=0,  DesiredRateYaw=0;
+float ErrorRateRoll=0,     ErrorRatePitch=0,    ErrorRateYaw=0;
+float PrevErrorRateRoll=0, PrevErrorRatePitch=0, PrevErrorRateYaw=0;
+float PrevItermRateRoll=0, PrevItermRatePitch=0, PrevItermRateYaw=0;
 
-  gyroRoll  = GyroXraw / 65.5 - gyroRollOffset;
-  gyroPitch = GyroYraw / 65.5 - gyroPitchOffset;
-  gyroYaw   = GyroZraw / 65.5 - gyroYawOffset;
+float InputRoll=0, InputPitch=0, InputYaw=0, InputThrottle=0;
+
+// ================== MOTOR OUTPUTS ==================
+float MotorInput1, MotorInput2, MotorInput3, MotorInput4;
+
+// ================== MOTORS ==================
+Servo mot1, mot2, mot3, mot4;
+
+// ============================================================
+//   INTERRUPT RECEIVER — Separate ISR per channel
+// ============================================================
+volatile uint32_t ch_start[5]  = {0, 0, 0, 0, 0};
+volatile uint16_t ch_value[5]  = {1500, 1500, 1000, 1500, 2000};
+
+// CH1 Roll
+void IRAM_ATTR isr_ch1() {
+  if (digitalRead(channel_1_pin)) ch_start[0] = micros();
+  else ch_value[0] = (uint16_t)(micros() - ch_start[0]);
+}
+// CH2 Pitch
+void IRAM_ATTR isr_ch2() {
+  if (digitalRead(channel_2_pin)) ch_start[1] = micros();
+  else ch_value[1] = (uint16_t)(micros() - ch_start[1]);
+}
+// CH3 Throttle
+void IRAM_ATTR isr_ch3() {
+  if (digitalRead(channel_3_pin)) ch_start[2] = micros();
+  else ch_value[2] = (uint16_t)(micros() - ch_start[2]);
+}
+// CH4 Yaw
+void IRAM_ATTR isr_ch4() {
+  if (digitalRead(channel_4_pin)) ch_start[3] = micros();
+  else ch_value[3] = (uint16_t)(micros() - ch_start[3]);
+}
+// CH5 Emergency Stop (VrA knob)
+void IRAM_ATTR isr_ch5() {
+  if (digitalRead(channel_5_pin)) ch_start[4] = micros();
+  else ch_value[4] = (uint16_t)(micros() - ch_start[4]);
 }
 
-void readAccel() {
+// Safe atomic read
+void read_receiver(uint16_t* rc) {
+  noInterrupts();
+  for (int i = 0; i < 5; i++) rc[i] = ch_value[i];
+  interrupts();
+}
+
+// ============================================================
+//   MY RC CALIBRATION — actual transmitter values
+//   Roll  : min=1110  mid=1509  max=1874
+//   Pitch : min=1175  mid=1462  max=1821
+//   Thr   : min=1099          max=1779
+//   Yaw   : min=1074  mid=1470  max=1826
+// ============================================================
+float normalize_stick(float input, float mn, float mid, float mx) {
+  float norm;
+  if (input <= mid)
+    norm = 1500.0f + (input - mid) * (500.0f / (mid - mn));
+  else
+    norm = 1500.0f + (input - mid) * (500.0f / (mx - mid));
+  return constrain(norm, 1000.0f, 2000.0f);
+}
+
+float normalize_throttle(float input, float mn, float mx) {
+  return constrain(
+    (input - mn) / (mx - mn) * 1000.0f + 1000.0f,
+    1000.0f, 2000.0f
+  );
+}
+
+float apply_deadband(float val, float db) {
+  if (abs(val) < db) return 0.0f;
+  return val;
+}
+
+// Roll → ±50° (0.1 * normalized offset from 1500)
+float map_roll(float rc) {
+  float norm = normalize_stick(rc, 1110, 1509, 1874);
+  return apply_deadband(norm - 1500.0f, 10) * 0.1f;
+}
+
+// Pitch → ±50°
+float map_pitch(float rc) {
+  float norm = normalize_stick(rc, 1175, 1462, 1821);
+  return apply_deadband(norm - 1500.0f, 10) * 0.1f;
+}
+
+// Yaw → ±75°/s
+float map_yaw(float rc) {
+  float norm = normalize_stick(rc, 1074, 1470, 1826);
+  return apply_deadband(norm - 1500.0f, 10) * 0.15f;
+}
+
+// Throttle → 1000~1800
+float map_throttle(float rc) {
+  float norm = normalize_throttle(rc, 1099, 1779);
+  return constrain(
+    (norm - 1000.0f) / 1000.0f * (ThrottleMax - ThrottleCutOff) + ThrottleCutOff,
+    ThrottleCutOff, ThrottleMax
+  );
+}
+
+// ============================================================
+//   LED HELPER
+// ============================================================
+void blink(int times, int ms = 100) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(LED_PIN, HIGH); delay(ms);
+    digitalWrite(LED_PIN, LOW);  delay(ms);
+  }
+}
+
+// ============================================================
+//   MPU6050 INIT
+// ============================================================
+void mpu_init() {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B); Wire.write(0x00);   // Wake up
+  Wire.endTransmission();
+
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x1A); Wire.write(0x05);   // DLPF
+  Wire.endTransmission();
+
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x1C); Wire.write(0x10);   // Accel ±8g
+  Wire.endTransmission();
+
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x1B); Wire.write(0x08);   // Gyro ±500°/s
+  Wire.endTransmission();
+}
+
+// ============================================================
+//   MPU6050 READ
+// ============================================================
+void read_mpu() {
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(0x3B);
   Wire.endTransmission(false);
   Wire.requestFrom(MPU_ADDR, 6, true);
 
-  AccXraw = (Wire.read() << 8 | Wire.read()) - accXOffset;
-  AccYraw = (Wire.read() << 8 | Wire.read()) - accYOffset;
-  AccZraw = (Wire.read() << 8 | Wire.read()) - accZOffset;
+  int16_t AccXLSB = Wire.read()<<8 | Wire.read();
+  int16_t AccYLSB = Wire.read()<<8 | Wire.read();
+  int16_t AccZLSB = Wire.read()<<8 | Wire.read();
 
-  accRoll  = atan2(AccYraw, AccZraw) * 57.2958;
-  accPitch = atan2(-AccXraw,
-                  sqrt((float)AccYraw * AccYraw +
-                       (float)AccZraw * AccZraw)) * 57.2958;
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x43);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU_ADDR, 6, true);
+
+  int16_t GyroX = Wire.read()<<8 | Wire.read();
+  int16_t GyroY = Wire.read()<<8 | Wire.read();
+  int16_t GyroZ = Wire.read()<<8 | Wire.read();
+
+  RateRoll  = (float)GyroX / 65.5f;
+  RatePitch = (float)GyroY / 65.5f;
+  RateYaw   = (float)GyroZ / 65.5f;
+
+  AccX = (float)AccXLSB / 4096.0f;
+  AccY = (float)AccYLSB / 4096.0f;
+  AccZ = (float)AccZLSB / 4096.0f;
+
+  RateRoll  -= RateCalibrationRoll;
+  RatePitch -= RateCalibrationPitch;
+  RateYaw   -= RateCalibrationYaw;
+  AccX      -= AccXCalibration;
+  AccY      -= AccYCalibration;
+  AccZ      -= AccZCalibration;
+
+  AngleRoll  =  atan(AccY / sqrt(AccX*AccX + AccZ*AccZ)) * 57.29f;
+  AnglePitch = -atan(AccX / sqrt(AccY*AccY + AccZ*AccZ)) * 57.29f;
 }
 
-/* ================= FILTER ================= */
-void updateAngles(float dt) {
-  float gyroRollAngle  = rollAngle  + gyroRoll  * dt;
-  float gyroPitchAngle = pitchAngle + gyroPitch * dt;
+// ============================================================
+//   AUTO CALIBRATION — runs on boot
+// ============================================================
+void calibrate_mpu() {
+  Serial.println("============================================");
+  Serial.println("        MPU6050 AUTO CALIBRATION");
+  Serial.println("============================================");
+  Serial.println(">> Place drone FLAT and STILL!");
 
-  rollAngle  = alpha * gyroRollAngle  + (1.0 - alpha) * accRoll;
-  pitchAngle = alpha * gyroPitchAngle + (1.0 - alpha) * accPitch;
-}
-
-/* ================= PID ================= */
-float pidUpdate(float error, float &prevError, float &iTerm,
-                float kp, float ki, float kd) {
-
-  const float dt = 0.004;
-
-  float p = kp * error;
-  iTerm += ki * (error + prevError) * dt * 0.5;
-  iTerm = constrain(iTerm, -400, 400);
-
-  float d = kd * (error - prevError) / dt;
-
-  prevError = error;
-  return constrain(p + iTerm + d, -400, 400);
-}
-
-/* ================= CALIBRATION ================= */
-void calibrateSensors() {
-
-  Serial.println("CALIBRATING GYRO...");
-  delay(2000);
-
-  for (int i = 0; i < 4000; i++) {
-    readGyro();
-    gyroRollOffset  += gyroRoll;
-    gyroPitchOffset += gyroPitch;
-    gyroYawOffset   += gyroYaw;
-    delay(1);
+  for (int i = 3; i > 0; i--) {
+    Serial.print(">> Starting in "); Serial.print(i); Serial.println("...");
+    blink(1, 400);
   }
 
-  gyroRollOffset  /= 4000;
-  gyroPitchOffset /= 4000;
-  gyroYawOffset   /= 4000;
+  const int N = 2000;
+  long gx_sum=0, gy_sum=0, gz_sum=0;
+  long ax_sum=0, ay_sum=0, az_sum=0;
 
-  Serial.println("CALIBRATING ACCEL...");
-  delay(2000);
-
-  long ax = 0, ay = 0, az = 0;
-
-  for (int i = 0; i < 4000; i++) {
+  for (int i = 0; i < N; i++) {
     Wire.beginTransmission(MPU_ADDR);
     Wire.write(0x3B);
     Wire.endTransmission(false);
     Wire.requestFrom(MPU_ADDR, 6, true);
+    ax_sum += (int16_t)(Wire.read()<<8 | Wire.read());
+    ay_sum += (int16_t)(Wire.read()<<8 | Wire.read());
+    az_sum += (int16_t)(Wire.read()<<8 | Wire.read());
 
-    ax += Wire.read() << 8 | Wire.read();
-    ay += Wire.read() << 8 | Wire.read();
-    az += Wire.read() << 8 | Wire.read();
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(0x43);
+    Wire.endTransmission(false);
+    Wire.requestFrom(MPU_ADDR, 6, true);
+    gx_sum += (int16_t)(Wire.read()<<8 | Wire.read());
+    gy_sum += (int16_t)(Wire.read()<<8 | Wire.read());
+    gz_sum += (int16_t)(Wire.read()<<8 | Wire.read());
+
+    if (i % 500 == 0) {
+      Serial.print(">> Progress: ");
+      Serial.print((i * 100) / N);
+      Serial.println("%");
+      digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+    }
     delay(1);
   }
 
-  accXOffset = ax / 4000.0;
-  accYOffset = ay / 4000.0;
-  accZOffset = (az / 4000.0) - 16384.0;
+  RateCalibrationRoll  = (gx_sum / (float)N) / 65.5f;
+  RateCalibrationPitch = (gy_sum / (float)N) / 65.5f;
+  RateCalibrationYaw   = (gz_sum / (float)N) / 65.5f;
 
-  readAccel();
-  rollAngle = accRoll;
-  pitchAngle = accPitch;
+  AccXCalibration =  ax_sum / (float)N / 4096.0f;
+  AccYCalibration =  ay_sum / (float)N / 4096.0f;
+  AccZCalibration = (az_sum / (float)N / 4096.0f) - 1.0f;
 
-  Serial.println("CALIBRATION DONE");
+  Serial.println(">> Progress: 100%");
+  Serial.println("============================================");
+  Serial.println("         CALIBRATION COMPLETE!");
+  Serial.println("============================================");
+  Serial.print("Gyro  → Roll:");  Serial.print(RateCalibrationRoll,  4);
+  Serial.print("  Pitch:");        Serial.print(RateCalibrationPitch, 4);
+  Serial.print("  Yaw:");          Serial.println(RateCalibrationYaw, 4);
+  Serial.print("Accel → X:");      Serial.print(AccXCalibration, 4);
+  Serial.print("  Y:");            Serial.print(AccYCalibration, 4);
+  Serial.print("  Z:");            Serial.println(AccZCalibration, 4);
+  Serial.println("============================================\n");
+
+  digitalWrite(LED_PIN, LOW);
+  delay(1000);
 }
 
-/* ================= SETUP ================= */
+// ============================================================
+//   RESET PID
+// ============================================================
+void reset_pid() {
+  PrevErrorRateRoll=0;   PrevErrorRatePitch=0;   PrevErrorRateYaw=0;
+  PrevItermRateRoll=0;   PrevItermRatePitch=0;   PrevItermRateYaw=0;
+  PrevErrorAngleRoll=0;  PrevErrorAnglePitch=0;
+  PrevItermAngleRoll=0;  PrevItermAnglePitch=0;
+  complementaryAngleRoll=0; complementaryAnglePitch=0;
+}
+
+// ============================================================
+//   SETUP
+// ============================================================
 void setup() {
   Serial.begin(115200);
+  delay(1000);
 
-  pinMode(CH1, INPUT);
-  pinMode(CH2, INPUT);
-  pinMode(CH3, INPUT);
-  pinMode(CH4, INPUT);
+  pinMode(LED_PIN, OUTPUT);
+  blink(5, 100);
 
-  attachInterrupt(CH1, ch1_ISR, CHANGE);
-  attachInterrupt(CH2, ch2_ISR, CHANGE);
-  attachInterrupt(CH3, ch3_ISR, CHANGE);
-  attachInterrupt(CH4, ch4_ISR, CHANGE);
+  Serial.println("============================================");
+  Serial.println("   ESP32 FLIGHT CONTROLLER BOOTING");
+  Serial.println("   M1=GPIO27 M2=GPIO14 M3=GPIO12 M4=GPIO13");
+  Serial.println("============================================");
 
-  mot13.attach(M13_PIN, 1000, 2000);
-  mot12.attach(M12_PIN, 1000, 2000);
-  mot14.attach(M14_PIN, 1000, 2000);
-  mot27.attach(M27_PIN, 1000, 2000);
-
+  // I2C
   Wire.begin(21, 22);
   Wire.setClock(400000);
+  delay(250);
+
+  // MPU check
+  mpu_init();
+  delay(250);
 
   Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x6B);
-  Wire.write(0x00);
-  Wire.endTransmission();
+  Wire.write(0x75);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU_ADDR, 1, true);
+  byte who = Wire.read();
 
-  Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x1B);
-  Wire.write(0x08);
-  Wire.endTransmission();
+  // if (who == 0x68) {
+  //   Serial.println(">> MPU6050 ✅ Found!");
+  // } else {
+  //   Serial.print(">> MPU6050 ❌ Not found! WHO_AM_I=0x");
+  //   Serial.println(who, HEX);
+  //   blink(10, 100);
+  // }
 
-  calibrateSensors();
+  // RC Receiver pins
+  // GPIO 34,35 = input only (no pullup)
+  // GPIO 32,33,25 = normal with pullup
+  pinMode(channel_1_pin, INPUT);
+  pinMode(channel_2_pin, INPUT);
+  pinMode(channel_3_pin, INPUT_PULLUP);
+  pinMode(channel_4_pin, INPUT_PULLUP);
+  pinMode(channel_5_pin, INPUT_PULLUP);
 
-  lastTime = micros();
-  Serial.println("READY");
+  attachInterrupt(digitalPinToInterrupt(channel_1_pin), isr_ch1, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(channel_2_pin), isr_ch2, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(channel_3_pin), isr_ch3, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(channel_4_pin), isr_ch4, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(channel_5_pin), isr_ch5, CHANGE);
+
+  Serial.println(">> RC Receiver ✅ Ready (5 channels)");
+  Serial.println(">> Waiting for RC signal (2s)...");
+  delay(2000);
+
+  // Show RC values
+  uint16_t rc[5];
+  read_receiver(rc);
+  Serial.println(">> Raw RC Values:");
+  Serial.print("   CH1(Roll)=");    Serial.print(rc[0]);
+  Serial.print("  CH2(Pitch)=");    Serial.print(rc[1]);
+  Serial.print("  CH3(Thr)=");      Serial.print(rc[2]);
+  Serial.print("  CH4(Yaw)=");      Serial.print(rc[3]);
+  Serial.print("  CH5(Estop)=");    Serial.println(rc[4]);
+
+  // ESC setup — setPeriodHertz BEFORE attach
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+
+  mot1.setPeriodHertz(ESCfreq);
+  mot2.setPeriodHertz(ESCfreq);
+  mot3.setPeriodHertz(ESCfreq);
+  mot4.setPeriodHertz(ESCfreq);
+
+  mot1.attach(mot1_pin, 1000, 2000);
+  mot2.attach(mot2_pin, 1000, 2000);
+  mot3.attach(mot3_pin, 1000, 2000);
+  mot4.attach(mot4_pin, 1000, 2000);
+
+  // Min signal for ESC init
+  mot1.writeMicroseconds(ThrottleCutOff);
+  mot2.writeMicroseconds(ThrottleCutOff);
+  mot3.writeMicroseconds(ThrottleCutOff);
+  mot4.writeMicroseconds(ThrottleCutOff);
+
+  Serial.println(">> ESCs ✅ Initialized");
+  Serial.println(">> Waiting for ESC beeps (3s)...");
+  delay(3000);
+
+  blink(2, 300);
+
+  // Auto Calibrate MPU
+  calibrate_mpu();
+
+  Serial.println("============================================");
+  Serial.println("            ✅ SYSTEM READY!");
+  Serial.println("   Throttle < 1030  → Motors OFF");
+  Serial.println("   CH5 VrA LEFT     → Emergency STOP");
+  Serial.println("============================================\n");
+
+  blink(3, 200);
+  LoopTimer = micros();
 }
 
-/* ================= LOOP ================= */
+// ============================================================
+//   MAIN LOOP — Strict 250Hz
+// ============================================================
 void loop() {
 
-  // Safety: motors off
-  if (ch3_value < 900) {
-    mot13.writeMicroseconds(1000);
-    mot12.writeMicroseconds(1000);
-    mot14.writeMicroseconds(1000);
-    mot27.writeMicroseconds(1000);
-    iRoll = iPitch = iYaw = 0;
+  // ── 1. READ MPU ──────────────────────────────────────────
+  read_mpu();
+
+  // ── 2. EMERGENCY STOP — CH5 VrA knob left ────────────────
+  // Check FIRST before anything else!
+  if (ch_value[4] < 1500) {
+    mot1.writeMicroseconds(ThrottleCutOff);
+    mot2.writeMicroseconds(ThrottleCutOff);
+    mot3.writeMicroseconds(ThrottleCutOff);
+    mot4.writeMicroseconds(ThrottleCutOff);
+    reset_pid();
+    Serial.println("🚨 EMERGENCY STOP — VrA knob!");
+    while (micros() - LoopTimer < (t * 1000000));
+    LoopTimer = micros();
     return;
   }
 
-  // Timing
-  unsigned long now = micros();
-  float dt = (now - lastTime) * 1e-6;
-  lastTime = now;
-  if (dt <= 0 || dt > 0.02) return;
+  // ── 3. COMPLEMENTARY FILTER ──────────────────────────────
+  complementaryAngleRoll  = 0.991f * (complementaryAngleRoll  + RateRoll  * t)
+                          + 0.009f * AngleRoll;
+  complementaryAnglePitch = 0.991f * (complementaryAnglePitch + RatePitch * t)
+                          + 0.009f * AnglePitch;
 
-  // Sensor update
-  readGyro();
-  readAccel();
-  updateAngles(dt);
+  // Clamp ±20°
+  complementaryAngleRoll  = constrain(complementaryAngleRoll,  -20.0f, 20.0f);
+  complementaryAnglePitch = constrain(complementaryAnglePitch, -20.0f, 20.0f);
 
-  // RC input
-  int thr = constrain(ch3_value, 1060, 2000);
+  // ── 4. READ RECEIVER ─────────────────────────────────────
+  uint16_t rc[5];
+  read_receiver(rc);
 
-  float desRoll  = (ch1_value - 1494) * 0.06;
-  float desPitch = (ch2_value - 1462) * 0.06;
-  float desYaw   = (ch4_value - 1470) * 0.15;
+  float rc_roll     = rc[0];
+  float rc_pitch    = rc[1];
+  float rc_throttle = rc[2];
+  float rc_yaw      = rc[3];
 
-  // PID
-  float rollPID  = pidUpdate(desRoll - rollAngle,  prevRollErr,  iRoll,  PRoll,  IRoll,  DRoll);
-  float pitchPID = pidUpdate(desPitch - pitchAngle, prevPitchErr, iPitch, PPitch, IPitch, DPitch);
-  float yawPID   = pidUpdate(desYaw - gyroYaw, prevYawErr, iYaw, PYaw, IYaw, DYaw);
+  // ── 5. THROTTLE CUTOFF ───────────────────────────────────
+  if (rc_throttle < 1030) {
+    mot1.writeMicroseconds(ThrottleCutOff);
+    mot2.writeMicroseconds(ThrottleCutOff);
+    mot3.writeMicroseconds(ThrottleCutOff);
+    mot4.writeMicroseconds(ThrottleCutOff);
+    reset_pid();
+    while (micros() - LoopTimer < (t * 1000000));
+    LoopTimer = micros();
+    return;
+  }
 
-  // Motor mixing
-  int m13 = thr - rollPID - pitchPID - yawPID;
-  int m12 = thr - rollPID + pitchPID + yawPID;
-  int m14 = thr + rollPID + pitchPID - yawPID;
-  int m27 = thr + rollPID - pitchPID + yawPID;
+  // ── 6. MAP RC → DESIRED VALUES ───────────────────────────
+  DesiredAngleRoll  = map_roll(rc_roll);
+  DesiredAnglePitch = map_pitch(rc_pitch);
+  DesiredRateYaw    = map_yaw(rc_yaw);
+  InputThrottle     = map_throttle(rc_throttle);
 
-  // Output
-  mot13.writeMicroseconds(constrain(m13, 1060, 2000));
-  mot12.writeMicroseconds(constrain(m12, 1060, 2000));
-  mot14.writeMicroseconds(constrain(m14, 1060, 2000));
-  mot27.writeMicroseconds(constrain(m27, 1060, 2000));
+  if (InputThrottle > ThrottleMax) InputThrottle = ThrottleMax;
 
-  // Debug
-  Serial.print("Roll: "); Serial.print(rollAngle);
-  Serial.print(" Pitch: "); Serial.print(pitchAngle);
-  Serial.print(" | M: ");
-  Serial.print(m13); Serial.print(" ");
-  Serial.print(m12); Serial.print(" ");
-  Serial.print(m14); Serial.print(" ");
-  Serial.println(m27);
+  // ── 7. OUTER PID — ANGLE LOOP ────────────────────────────
+  // Roll
+  ErrorAngleRoll  = DesiredAngleRoll - complementaryAngleRoll;
+  PtermRoll       = PAngleRoll * ErrorAngleRoll;
+  ItermRoll       = PrevItermAngleRoll
+                  + IAngleRoll * (ErrorAngleRoll + PrevErrorAngleRoll) * (t/2.0f);
+  ItermRoll       = constrain(ItermRoll, -400.0f, 400.0f);
+  DtermRoll       = DAngleRoll * (ErrorAngleRoll - PrevErrorAngleRoll) / t;
+  PIDOutputRoll   = constrain(PtermRoll + ItermRoll + DtermRoll, -400.0f, 400.0f);
+  DesiredRateRoll = PIDOutputRoll;
+  PrevErrorAngleRoll  = ErrorAngleRoll;
+  PrevItermAngleRoll  = ItermRoll;
+
+  // Pitch
+  ErrorAnglePitch  = DesiredAnglePitch - complementaryAnglePitch;
+  PtermPitch       = PAnglePitch * ErrorAnglePitch;
+  ItermPitch       = PrevItermAnglePitch
+                   + IAnglePitch * (ErrorAnglePitch + PrevErrorAnglePitch) * (t/2.0f);
+  ItermPitch       = constrain(ItermPitch, -400.0f, 400.0f);
+  DtermPitch       = DAnglePitch * (ErrorAnglePitch - PrevErrorAnglePitch) / t;
+  PIDOutputPitch   = constrain(PtermPitch + ItermPitch + DtermPitch, -400.0f, 400.0f);
+  DesiredRatePitch = PIDOutputPitch;
+  PrevErrorAnglePitch = ErrorAnglePitch;
+  PrevItermAnglePitch = ItermPitch;
+
+  // ── 8. INNER PID — RATE LOOP ─────────────────────────────
+  // Roll rate
+  ErrorRateRoll   = DesiredRateRoll - RateRoll;
+  PtermRoll       = PRateRoll * ErrorRateRoll;
+  ItermRoll       = PrevItermRateRoll
+                  + IRateRoll * (ErrorRateRoll + PrevErrorRateRoll) * (t/2.0f);
+  ItermRoll       = constrain(ItermRoll, -400.0f, 400.0f);
+  DtermRoll       = DRateRoll * (ErrorRateRoll - PrevErrorRateRoll) / t;
+  InputRoll       = constrain(PtermRoll + ItermRoll + DtermRoll, -400.0f, 400.0f);
+  PrevErrorRateRoll  = ErrorRateRoll;
+  PrevItermRateRoll  = ItermRoll;
+
+  // Pitch rate
+  ErrorRatePitch  = DesiredRatePitch - RatePitch;
+  PtermPitch      = PRatePitch * ErrorRatePitch;
+  ItermPitch      = PrevItermRatePitch
+                  + IRatePitch * (ErrorRatePitch + PrevErrorRatePitch) * (t/2.0f);
+  ItermPitch      = constrain(ItermPitch, -400.0f, 400.0f);
+  DtermPitch      = DRatePitch * (ErrorRatePitch - PrevErrorRatePitch) / t;
+  InputPitch      = constrain(PtermPitch + ItermPitch + DtermPitch, -400.0f, 400.0f);
+  PrevErrorRatePitch = ErrorRatePitch;
+  PrevItermRatePitch = ItermPitch;
+
+  // Yaw rate
+  ErrorRateYaw    = DesiredRateYaw - RateYaw;
+  PtermYaw        = PRateYaw * ErrorRateYaw;
+  ItermYaw        = PrevItermRateYaw
+                  + IRateYaw * (ErrorRateYaw + PrevErrorRateYaw) * (t/2.0f);
+  ItermYaw        = constrain(ItermYaw, -400.0f, 400.0f);
+  DtermYaw        = DRateYaw * (ErrorRateYaw - PrevErrorRateYaw) / t;
+  InputYaw        = constrain(PtermYaw + ItermYaw + DtermYaw, -400.0f, 400.0f);
+  PrevErrorRateYaw   = ErrorRateYaw;
+  PrevItermRateYaw   = ItermYaw;
+
+  // ── 9. MOTOR MIX ─────────────────────────────────────────
+  //        FRONT
+  //  M4(CW)13 ── M1(CCW)27
+  //       \  X  /
+  //  M3(CCW)12 ── M2(CW)14
+  //        REAR
+
+  MotorInput1 = InputThrottle - InputRoll - InputPitch - InputYaw; // FR CCW
+  MotorInput2 = InputThrottle - InputRoll + InputPitch + InputYaw; // RR CW
+  MotorInput3 = InputThrottle + InputRoll + InputPitch - InputYaw; // RL CCW
+  MotorInput4 = InputThrottle + InputRoll - InputPitch + InputYaw; // FL CW
+
+  // Clamp motors
+  MotorInput1 = constrain(MotorInput1, ThrottleIdle, 1999);
+  MotorInput2 = constrain(MotorInput2, ThrottleIdle, 1999);
+  MotorInput3 = constrain(MotorInput3, ThrottleIdle, 1999);
+  MotorInput4 = constrain(MotorInput4, ThrottleIdle, 1999);
+
+  // ── 10. WRITE MOTORS ─────────────────────────────────────
+  mot1.writeMicroseconds((int)MotorInput1);
+  mot2.writeMicroseconds((int)MotorInput2);
+  mot3.writeMicroseconds((int)MotorInput3);
+  mot4.writeMicroseconds((int)MotorInput4);
+
+  // ── 11. SERIAL DEBUG ─────────────────────────────────────
+  Serial.print("Roll:");   Serial.print(complementaryAngleRoll,  1);
+  Serial.print(" Pitch:"); Serial.print(complementaryAnglePitch, 1);
+  Serial.print(" Thr:");   Serial.print((int)InputThrottle);
+  Serial.print(" | M1:");  Serial.print((int)MotorInput1);
+  Serial.print(" M2:");    Serial.print((int)MotorInput2);
+  Serial.print(" M3:");    Serial.print((int)MotorInput3);
+  Serial.print(" M4:");    Serial.println((int)MotorInput4);
+
+  // ── 12. STRICT 250Hz LOOP TIMING — bug fixed ─────────────
+  while (micros() - LoopTimer < (t * 1000000));
+  LoopTimer = micros();
 }
