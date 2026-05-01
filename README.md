@@ -7,7 +7,7 @@ A fully custom, from-scratch flight controller built on the **ESP32** microcontr
 ## ✨ Features
 
 - **Cascaded PID Control** — Outer angle loop feeds into inner rate loop for smooth, stable flight
-- **1D Kalman Filter** — Fuses gyroscope and accelerometer data for accurate angle estimation
+- **Complimentary Filter** — Fuses gyroscope and accelerometer data for accurate angle estimation
 - **Raw I2C Communication** — Talks directly to the MPU-6050 with no external IMU libraries
 - **PWM Receiver Input** — 4-channel RC input read via hardware interrupts for zero-latency response
 - **Arm/Disarm Logic** — Safe arming sequence (Throttle low + Yaw right to arm, Yaw left to disarm)
