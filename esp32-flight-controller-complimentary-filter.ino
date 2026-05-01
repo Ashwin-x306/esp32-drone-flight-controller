@@ -1,6 +1,5 @@
 // ============================================================
 //   ESP32 FLIGHT CONTROLLER
-//   Updated for drone configuration
 //   M1=GPIO27 M2=GPIO14 M3=GPIO12 M4=GPIO13
 //   RC Calibrated to your transmitter values
 //   + Emergency Stop CH5 (VrA knob GPIO25)
@@ -11,7 +10,7 @@
 #include <Wire.h>
 #include <ESP32Servo.h>
 
-// ================== YOUR MOTOR PINS ==================
+// ================== MY MOTOR PINS ==================
 //        FRONT
 //  M4(CW)13 ── M1(CCW)27
 //       \  X  /
@@ -28,22 +27,22 @@ const int channel_1_pin = 34;   // Roll
 const int channel_2_pin = 35;   // Pitch
 const int channel_3_pin = 32;   // Throttle
 const int channel_4_pin = 33;   // Yaw
-const int channel_5_pin = 25;   // Emergency Stop (VrA knob)
+const int channel_5_pin = 25;   // Emergency Stop (vrA knob)
 
 // ================== LED ==================
 #define LED_PIN   15
 
 // ================== ESC ==================
 int ESCfreq     = 500;
-int ThrottleIdle   = 1180;   // your ESC starts at 1180
+int ThrottleIdle   = 1180;   
 int ThrottleCutOff = 1000;
 int ThrottleMax    = 1800;
 
-// ================== LOOP TIMING ==================
+
 uint32_t LoopTimer;
 float t = 0.004f;   // 4ms = 250Hz
 
-// ================== MPU6050 ==================
+
 #define MPU_ADDR  0x68
 
 volatile float RateRoll, RatePitch, RateYaw;
@@ -51,7 +50,6 @@ volatile float AccX, AccY, AccZ;
 volatile float AngleRoll, AnglePitch;
 
 // ================== CALIBRATION ==================
-// Auto-computed on boot — no hardcoded values!
 float RateCalibrationRoll  = 0;
 float RateCalibrationPitch = 0;
 float RateCalibrationYaw   = 0;
@@ -64,7 +62,7 @@ float complementaryAngleRoll  = 0.0f;
 float complementaryAnglePitch = 0.0f;
 
 // ================== PID GAINS ==================
-// Outer — Angle loop
+
 float PAngleRoll  = 2.0f;  float PAnglePitch  = 2.0f;
 float IAngleRoll  = 0.5f;  float IAnglePitch  = 0.5f;
 float DAngleRoll  = 0.007f; float DAnglePitch = 0.007f;
@@ -96,15 +94,11 @@ float PrevItermRateRoll=0, PrevItermRatePitch=0, PrevItermRateYaw=0;
 
 float InputRoll=0, InputPitch=0, InputYaw=0, InputThrottle=0;
 
-// ================== MOTOR OUTPUTS ==================
 float MotorInput1, MotorInput2, MotorInput3, MotorInput4;
 
-// ================== MOTORS ==================
 Servo mot1, mot2, mot3, mot4;
 
-// ============================================================
-//   INTERRUPT RECEIVER — Separate ISR per channel
-// ============================================================
+
 volatile uint32_t ch_start[5]  = {0, 0, 0, 0, 0};
 volatile uint16_t ch_value[5]  = {1500, 1500, 1000, 1500, 2000};
 
@@ -142,10 +136,9 @@ void read_receiver(uint16_t* rc) {
 }
 
 // ============================================================
-//   MY RC CALIBRATION — actual transmitter values
 //   Roll  : min=1110  mid=1509  max=1874
 //   Pitch : min=1175  mid=1462  max=1821
-//   Thr   : min=1099          max=1779
+//   Thr   : min=1099     max=1779
 //   Yaw   : min=1074  mid=1470  max=1826
 // ============================================================
 float normalize_stick(float input, float mn, float mid, float mx) {
@@ -169,7 +162,7 @@ float apply_deadband(float val, float db) {
   return val;
 }
 
-// Roll → ±50° (0.1 * normalized offset from 1500)
+
 float map_roll(float rc) {
   float norm = normalize_stick(rc, 1110, 1509, 1874);
   return apply_deadband(norm - 1500.0f, 10) * 0.1f;
@@ -196,9 +189,6 @@ float map_throttle(float rc) {
   );
 }
 
-// ============================================================
-//   LED HELPER
-// ============================================================
 void blink(int times, int ms = 100) {
   for (int i = 0; i < times; i++) {
     digitalWrite(LED_PIN, HIGH); delay(ms);
@@ -206,30 +196,26 @@ void blink(int times, int ms = 100) {
   }
 }
 
-// ============================================================
-//   MPU6050 INIT
-// ============================================================
+
 void mpu_init() {
   Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x6B); Wire.write(0x00);   // Wake up
+  Wire.write(0x6B); Wire.write(0x00);   
   Wire.endTransmission();
 
   Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x1A); Wire.write(0x05);   // DLPF
+  Wire.write(0x1A); Wire.write(0x05);   
   Wire.endTransmission();
 
   Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x1C); Wire.write(0x10);   // Accel ±8g
+  Wire.write(0x1C); Wire.write(0x10);   
   Wire.endTransmission();
 
   Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x1B); Wire.write(0x08);   // Gyro ±500°/s
+  Wire.write(0x1B); Wire.write(0x08);   
   Wire.endTransmission();
 }
 
-// ============================================================
-//   MPU6050 READ
-// ============================================================
+
 void read_mpu() {
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(0x3B);
@@ -268,9 +254,7 @@ void read_mpu() {
   AnglePitch = -atan(AccX / sqrt(AccY*AccY + AccZ*AccZ)) * 57.29f;
 }
 
-// ============================================================
-//   AUTO CALIBRATION — runs on boot
-// ============================================================
+
 void calibrate_mpu() {
   Serial.println("============================================");
   Serial.println("        MPU6050 AUTO CALIBRATION");
@@ -367,7 +351,6 @@ void setup() {
   Wire.setClock(400000);
   delay(250);
 
-  // MPU check
   mpu_init();
   delay(250);
 
@@ -378,9 +361,9 @@ void setup() {
   byte who = Wire.read();
 
   // if (who == 0x68) {
-  //   Serial.println(">> MPU6050 ✅ Found!");
+  //   Serial.println(">> MPU6050  Found!");
   // } else {
-  //   Serial.print(">> MPU6050 ❌ Not found! WHO_AM_I=0x");
+  //   Serial.print(">> MPU6050 Not found! WHO_AM_I=0x");
   //   Serial.println(who, HEX);
   //   blink(10, 100);
   // }
@@ -400,7 +383,7 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(channel_4_pin), isr_ch4, CHANGE);
   attachInterrupt(digitalPinToInterrupt(channel_5_pin), isr_ch5, CHANGE);
 
-  Serial.println(">> RC Receiver ✅ Ready (5 channels)");
+  Serial.println(">> RC Receiver Ready (5 channels)");
   Serial.println(">> Waiting for RC signal (2s)...");
   delay(2000);
 
@@ -414,7 +397,6 @@ void setup() {
   Serial.print("  CH4(Yaw)=");      Serial.print(rc[3]);
   Serial.print("  CH5(Estop)=");    Serial.println(rc[4]);
 
-  // ESC setup — setPeriodHertz BEFORE attach
   ESP32PWM::allocateTimer(0);
   ESP32PWM::allocateTimer(1);
   ESP32PWM::allocateTimer(2);
@@ -430,13 +412,13 @@ void setup() {
   mot3.attach(mot3_pin, 1000, 2000);
   mot4.attach(mot4_pin, 1000, 2000);
 
-  // Min signal for ESC init
+
   mot1.writeMicroseconds(ThrottleCutOff);
   mot2.writeMicroseconds(ThrottleCutOff);
   mot3.writeMicroseconds(ThrottleCutOff);
   mot4.writeMicroseconds(ThrottleCutOff);
 
-  Serial.println(">> ESCs ✅ Initialized");
+  Serial.println(">> ESCs Initialized");
   Serial.println(">> Waiting for ESC beeps (3s)...");
   delay(3000);
 
@@ -446,7 +428,7 @@ void setup() {
   calibrate_mpu();
 
   Serial.println("============================================");
-  Serial.println("            ✅ SYSTEM READY!");
+  Serial.println("           SYSTEM READY!");
   Serial.println("   Throttle < 1030  → Motors OFF");
   Serial.println("   CH5 VrA LEFT     → Emergency STOP");
   Serial.println("============================================\n");
@@ -455,23 +437,20 @@ void setup() {
   LoopTimer = micros();
 }
 
-// ============================================================
-//   MAIN LOOP — Strict 250Hz
-// ============================================================
+
 void loop() {
 
   // ── 1. READ MPU ──────────────────────────────────────────
   read_mpu();
 
-  // ── 2. EMERGENCY STOP — CH5 VrA knob left ────────────────
-  // Check FIRST before anything else!
+// emergenycy stop
   if (ch_value[4] < 1500) {
     mot1.writeMicroseconds(ThrottleCutOff);
     mot2.writeMicroseconds(ThrottleCutOff);
     mot3.writeMicroseconds(ThrottleCutOff);
     mot4.writeMicroseconds(ThrottleCutOff);
     reset_pid();
-    Serial.println("🚨 EMERGENCY STOP — VrA knob!");
+    Serial.println(" EMERGENCY STOP — VrA knob!");
     while (micros() - LoopTimer < (t * 1000000));
     LoopTimer = micros();
     return;
@@ -487,7 +466,6 @@ void loop() {
   complementaryAngleRoll  = constrain(complementaryAngleRoll,  -20.0f, 20.0f);
   complementaryAnglePitch = constrain(complementaryAnglePitch, -20.0f, 20.0f);
 
-  // ── 4. READ RECEIVER ─────────────────────────────────────
   uint16_t rc[5];
   read_receiver(rc);
 
@@ -516,8 +494,6 @@ void loop() {
 
   if (InputThrottle > ThrottleMax) InputThrottle = ThrottleMax;
 
-  // ── 7. OUTER PID — ANGLE LOOP ────────────────────────────
-  // Roll
   ErrorAngleRoll  = DesiredAngleRoll - complementaryAngleRoll;
   PtermRoll       = PAngleRoll * ErrorAngleRoll;
   ItermRoll       = PrevItermAngleRoll
@@ -529,7 +505,7 @@ void loop() {
   PrevErrorAngleRoll  = ErrorAngleRoll;
   PrevItermAngleRoll  = ItermRoll;
 
-  // Pitch
+
   ErrorAnglePitch  = DesiredAnglePitch - complementaryAnglePitch;
   PtermPitch       = PAnglePitch * ErrorAnglePitch;
   ItermPitch       = PrevItermAnglePitch
@@ -541,8 +517,7 @@ void loop() {
   PrevErrorAnglePitch = ErrorAnglePitch;
   PrevItermAnglePitch = ItermPitch;
 
-  // ── 8. INNER PID — RATE LOOP ─────────────────────────────
-  // Roll rate
+  
   ErrorRateRoll   = DesiredRateRoll - RateRoll;
   PtermRoll       = PRateRoll * ErrorRateRoll;
   ItermRoll       = PrevItermRateRoll
@@ -553,7 +528,7 @@ void loop() {
   PrevErrorRateRoll  = ErrorRateRoll;
   PrevItermRateRoll  = ItermRoll;
 
-  // Pitch rate
+  
   ErrorRatePitch  = DesiredRatePitch - RatePitch;
   PtermPitch      = PRatePitch * ErrorRatePitch;
   ItermPitch      = PrevItermRatePitch
@@ -564,7 +539,7 @@ void loop() {
   PrevErrorRatePitch = ErrorRatePitch;
   PrevItermRatePitch = ItermPitch;
 
-  // Yaw rate
+  
   ErrorRateYaw    = DesiredRateYaw - RateYaw;
   PtermYaw        = PRateYaw * ErrorRateYaw;
   ItermYaw        = PrevItermRateYaw
@@ -575,12 +550,7 @@ void loop() {
   PrevErrorRateYaw   = ErrorRateYaw;
   PrevItermRateYaw   = ItermYaw;
 
-  // ── 9. MOTOR MIX ─────────────────────────────────────────
-  //        FRONT
-  //  M4(CW)13 ── M1(CCW)27
-  //       \  X  /
-  //  M3(CCW)12 ── M2(CW)14
-  //        REAR
+ 
 
   MotorInput1 = InputThrottle - InputRoll - InputPitch - InputYaw; // FR CCW
   MotorInput2 = InputThrottle - InputRoll + InputPitch + InputYaw; // RR CW
