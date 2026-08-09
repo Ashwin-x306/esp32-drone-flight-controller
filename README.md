@@ -1,10 +1,10 @@
-# 🚁 ESP32 Quadcopter Flight Controller
+#  ESP32 Quadcopter Flight Controller
 
 A fully custom, from-scratch flight controller built on the **ESP32** microcontroller. No libraries, no shortcuts — raw I2C, PWM receiver input via interrupts, hand-tuned cascaded PID, and a Kalman filter running at 250Hz.
 
 ---
 
-## ✨ Features
+##  Features
 
 - **Cascaded PID Control** — Outer angle loop feeds into inner rate loop for smooth, stable flight
 - **Complimentary Filter** — Fuses gyroscope and accelerometer data for accurate angle estimation
@@ -17,7 +17,7 @@ A fully custom, from-scratch flight controller built on the **ESP32** microcontr
 
 ---
 
-## 🛠️ Hardware
+##  Hardware
 
 | Component | Details |
 |---|---|
@@ -29,7 +29,7 @@ A fully custom, from-scratch flight controller built on the **ESP32** microcontr
 
 ---
 
-## 📌 Pin Map
+##  Pin Map
 
 ### MPU-6050 (I2C)
 | MPU-6050 Pin | ESP32 Pin |
@@ -55,11 +55,11 @@ A fully custom, from-scratch flight controller built on the **ESP32** microcontr
 | CH3 | Throttle | GPIO 32 |
 | CH4 | Yaw | GPIO 33 |
 
-> ⚠️ GPIO 34 & 35 are **input-only** pins on ESP32 — perfect for receiver signals.
+>  GPIO 34 & 35 are **input-only** pins on ESP32 — perfect for receiver signals.
 
 ---
 
-## 🧠 How It Works
+##  How It Works
 
 ### 1. Sensor Reading
 The MPU-6050 is read directly over I2C at 400kHz. Raw 16-bit values are converted to °/s (gyro) and g-forces (accel). A hardware low-pass filter is configured on the MPU for noise reduction.
@@ -88,8 +88,8 @@ Each receiver channel is read using `attachInterrupt()` on CHANGE — measuring 
 ### 5. Arm / Disarm
 | Action | Stick Position |
 |---|---|
-| ✅ Arm | Throttle LOW + Yaw RIGHT (>1900µs) |
-| ❌ Disarm | Throttle LOW + Yaw LEFT (<1100µs) |
+|  Arm | Throttle LOW + Yaw RIGHT (>1900µs) |
+|  Disarm | Throttle LOW + Yaw LEFT (<1100µs) |
 
 When disarmed, all motors are held at minimum. The drone will not respond to any input until armed.
 
@@ -103,7 +103,7 @@ Motor4 (Rear-Right)  = Throttle + Roll - Pitch + Yaw
 
 ---
 
-## ⚙️ PID Gains (Tuned)
+##  PID Gains (Tuned)
 
 | Loop | P | I | D |
 |---|---|---|---|
